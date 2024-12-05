@@ -1,0 +1,976 @@
+---
+title: "RepSeq_analysis"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing a chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
+
+
+
+
+To use this pipeline you will need to install a local copy of
+* MiXCR https://github.com/milaboratory/mixcr/releases/tag/v4.7.0 (requires a license)
+* VDJtools https://github.com/mikessh/vdjtools/releases/tag/1.2.1
+* VDJmatch https://github.com/antigenomics/vdjmatch/releases/tag/1.3.1
+* ALICE https://github.com/pogorely/ALICE.git
+* OLGA https://github.com/statbiophys/OLGA.git
+
+It is crucial to add the path to OLGA to your PATH variable in R
+
+
+Required packages
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install(version = "3.16")
+BiocManager::install("Biostrings")
+library(stringr)
+library(dplyr)
+library(tidyr)
+library(data.table)
+library(stringdist)
+library(reshape2)
+library(igraph)
+library(ggplot2)
+library(ggseqlogo)
+setwd("/home/user/")
+```
+
+Setting up directories
+```{r}
+#specify directories to mixcr and vdjtools (optional)
+path_to_mixcr <- "/home/user/software/mixcr/mixcr.jar"
+path_to_vdj <- "/home/user/software/vdjtools/vdjtools.jar"
+path_to_vdj_match <- "/home/user/software/vdjmatch-1.3.1/vdjmatch-1.3.1.jar"
+
+#sample batch file (.tsv, .txt) of the following structure: column1 - sampleID, column2 - SMART (6 letters), column3 - R1 fastq file name (without path), column 4 - R2 fastq file name (without path)
+samples <- read.csv("/home/user/samples.csv")
+
+#set directories for input and output files
+path_to_fastq <- "/home/user/path_to_fastq_files/"
+path_to_output_dir <- "/home/dariyasiv/output_dir"
+
+#set preset and setup for analyze (automatic effective threshold during refineTagsAndSort vs set recordsPerConsensus during assemble)
+preset_analyze <- "milab-human-rna-tcr-umi-race --species hsa -f --assemble-clonotypes-by cdr3"
+preset_analyze <- "generic-amplicon --floating-left-alignment-boundary --rigid-right-alignment-boundary C --rna --species hsa -f --assemble-clonotypes-by cdr3"
+
+# "auto" (str) - with effective threshold
+# n (int) - with recordsPerConsensus=n and postFilter=null
+setup <- "auto"
+
+#set export preset
+preset_export <- "--chains TRB --drop-default-fields -uniqueTagCount Molecule -uniqueTagFraction Molecule -nFeature CDR3 -aaFeature CDR3 -vHit -dHit -jHit -positionOf VEnd -positionOf DBegin -positionOf DEnd -positionOf JBegin"
+
+```
+
+NO NEED TO CHANGE ANYTHING IN THIS CHUNCK, ONLY EXECUTE
+```{r}
+if (setup == "auto") {
+  mode <- " "
+  md <- ""
+} else {
+  mode <- str_glue(" -M refineTagsAndSort.parameters.postFilter=null -M assemble.consensusAssemblerParameters.assembler.minRecordsPerConsensus={setup} ")
+  md <- str_glue("_NULL_T{setup}")
+}
+
+
+#setup analyze report
+#WARNING! the column names in the exported table are offset by one column to the left (didn't come up with a way to fix that yet)
+run_stats = function(folderpath){
+  al_report_features <- c('Analysis date',
+                          'Input file(s)',
+                          'Output file(s)',
+                          'Version',
+                          'Command line arguments',
+                          'Total sequencing reads',
+                          'Successfully aligned reads',
+                          'CDR3:',
+                          'FR3_TO_FR4',
+                          'CDR2_TO_FR4',
+                          'FR2_TO_FR4',
+                          'CDR1_TO_FR4',
+                          'VDJRegion',
+                          'Overlapped',
+                          'Overlapped and aligned',
+                          'Overlapped and not aligned',
+                          'Alignment-aided overlaps, percent of overlapped and aligned',
+                          'No CDR3 parts alignments, percent of successfully aligned',
+                          'Partial aligned reads, percent of successfully aligned',
+                          'V gene chimeras',
+                          'J gene chimeras',
+                          'Paired-end alignment conflicts eliminated',
+                          'Realigned with forced non-floating bound',
+                          'Realigned with forced non-floating right bound in left read',
+                          'Realigned with forced non-floating left bound in right read',
+                          'TRA chains',
+                          'TRA non-functional',
+                          'TRB chains',
+                          'TRB non-functional',
+                          'Total reads',
+                          'Matched reads')
+  al_spec_report_features <- c("no hits",
+                        "absence of V hits",
+                        "absence of J hits",
+                        "no target with both V and J alignments",
+                        "absent barcode")
+  ref_report_features <- c('Analysis date',
+                           'Input file(s)',
+                           'Output file(s)',
+                           'Version',
+                           'Command line arguments',
+                           'Time spent in correction',
+                           'Number of input records',
+                           'Number of output records',
+                           'UMI input diversity',
+                           'UMI output diversity',
+                           'UMI input reads',
+                           'UMI output reads',
+                           'UMI mean reads per tag',
+                           'UMI input core diversity',
+                           'UMI input core reads',
+                           'UMI directly corrected diversity',
+                           'UMI directly corrected reads',
+                           'UMI diversity filtered by tag quality',
+                           'UMI reads filtered by tag quality',
+                           'UMI diversity filtered by whitelist',
+                           'UMI recursively corrected',
+                           'Number of groups',
+                           'Number of groups accepted',
+                           'Total records weight',
+                           'Records weight accepted',
+                           'Effective threshold')
+  asmbl_report_features <- c('Analysis date',
+                             'Input file(s)',
+                             'Output file(s)',
+                             'Version',
+                             'Command line arguments',
+                             'Final clonotype count',
+                             'Reads used in clonotypes, percent of total',
+                             'Average number of reads per clonotype',
+                             'Reads dropped due to the lack of a clone sequence, percent of total',
+                             'Reads dropped due to a too short clonal sequence, percent of total',
+                             'Reads dropped due to low quality, percent of total',
+                             'Reads dropped due to failed mapping, percent of total',
+                             'Reads dropped with low quality clones, percent of total',
+                             'Aligned reads processed',
+                             'Reads used in clonotypes before clustering, percent of total',
+                             'Number of reads used as a core, percent of used',
+                             'Mapped low quality reads, percent of used',
+                             'Reads clustered in PCR error correction, percent of used',
+                             'Reads pre-clustered due to the similar VJC-lists, percent of used',
+                             'Clonotypes dropped as low quality',
+                             'Clonotypes eliminated by PCR error correction',
+                             'Clonotypes pre-clustered due to the similar VJC-lists',
+                             'Clones dropped in post filtering',
+                             'Reads dropped in post filtering',
+                             'Alignments filtered by tag prefix',
+                             'TRA chains',
+                             'TRA non-functional',
+                             'TRB chains',
+                             'TRB non-functional',
+                             'Number of input groups',
+                             'Number of input groups with no assembling feature',
+                             'Number of input alignments',
+                             'Number of alignments with assembling feature',
+                             'Number of output pre-clones',
+                             'Number of assembling feature sequences in groups with zero pre-clonotypes',
+                             'Number of dropped pre-clones by tag suffix conflict',
+                             'Number of dropped alignments by tag suffix conflict',
+                             'Number of core alignments',
+                             'Discarded core alignments',
+                             'Empirically assigned alignments',
+                             'Empirical assignment conflicts',
+                             'Tag+VJ-gene empirically assigned alignments',
+                             'VJ-gene empirically assigned alignments',
+                             'Tag empirically assigned alignments',
+                             'Number of ambiguous groups',
+                             'Number of ambiguous V-genes',
+                             'Number of ambiguous J-genes',
+                             'Number of ambiguous tag+V/J-gene combinations',
+                             'Ignored non-productive alignments',
+                             'Unassigned alignments')
+  
+  filelist_al = list.files(path = folderpath, pattern = "*align.report.txt", full.names = T)
+  align_stats = lapply(filelist_al, function(x) read.table(file = x, header=F, sep = '\t', fill = T))
+  names(align_stats) = list.files(path = folderpath, pattern = "*align.report.txt", full.names = F)
+  filelist_ref = list.files(path =paste(folderpath, "", sep=''), pattern = "*refine.report.txt", full.names = T)
+  ref_stats = lapply(filelist_ref, function(x) read.table(file = x, header=F, sep = '\t', fill = T))
+  names(ref_stats) = list.files(path = folderpath, pattern = "*refine.report.txt", full.names = F)
+  filelist_as = list.files(path = folderpath, pattern = "*assemble.report.txt", full.names = T)
+  asmbl_stats = lapply(filelist_as, function(x) read.table(file = x, header=F, sep = '\t', fill = T))
+  names(asmbl_stats) = list.files(path = folderpath, pattern = "*assemble.report.txt", full.names = F)
+  
+  al = list()
+  for (i in 1:length(align_stats)){
+    al[[i]] = as.data.frame(t(sapply(al_report_features, 
+                                     function(x) {
+                                       if (length(grep(align_stats[[i]][,1],pattern = x,value = T,fixed=T))==0) {
+                                         return(0)
+                                       } else {
+                                         list = strsplit(grep(align_stats[[i]][,1],
+                                                              pattern = x,
+                                                              value = T,
+                                                              fixed=T),
+                                                         split = ": ")
+                                         return(list[[1]][length(list[[1]])])
+                                       }
+                                     })))
+  }
+  names(al) = list.files(path =paste(folderpath, "",sep = ''), pattern = "*align.report.txt", full.names = F)
+  al = do.call(rbind, al)
+  
+  re = list()
+  for (i in 1:length(ref_stats)){
+    re[[i]] = as.data.frame(t(sapply(ref_report_features, 
+                                     function(x) {
+                                       if (length(grep(ref_stats[[i]][,1],pattern = x,value = T,fixed=T))==0) {
+                                         return(0)
+                                       } else {
+                                         list = strsplit(grep(ref_stats[[i]][,1],
+                                                              pattern = x,
+                                                              value = T,
+                                                              fixed=T),
+                                                         split = ": ")
+                                         return(list[[1]][length(list[[1]])])
+                                       }
+                                     })))
+  }
+  names(re) = list.files(path =paste(folderpath, "", sep=''), pattern = "*refine.report.txt", full.names = F)
+  re = do.call(rbind, re)
+  
+  as = list()
+  for (i in 1:length(asmbl_stats)){
+    as[[i]]=as.data.frame(t(sapply(asmbl_report_features, 
+                                   function(x) {
+                                     if (length(grep(asmbl_stats[[i]][,1],pattern = x,value = T,fixed=T))==0) {
+                                       return(0)
+                                     } else {
+                                       list = strsplit(grep(asmbl_stats[[i]][,1],
+                                                            pattern = x,
+                                                            value = T,
+                                                            fixed=T),
+                                                       split = ": ")
+                                       return(list[[1]][length(list[[1]])])
+                                     }
+                                   }
+    )
+    )
+    )
+  }
+  names(as) = list.files(path = folderpath, pattern = "*assemble.report.txt", full.names = F)
+  as = do.call(rbind, as)
+  
+  all <- cbind(al, re, as)
+  write.table(t(all), file = paste(folderpath,'mixcr_stats.tsv', sep='/'), quote = F, sep = '\t', row.names = T, col.names = T)
+  
+}
+```
+
+MiXCR Pipeline to create .tsv repertoire tables
+```{r}
+#preform analyze (align, refine and assemble)
+for (i in 1:nrow(samples)) {
+  tagPattern <- paste(r'(--tag-pattern "^N{19}(R1:*)\^)', str_glue('tggtatcaacgcagag{samples$V2[i]}(UMI:TNNNNTNNNNTNNNN)TCT(R2:*)\"'), sep ="")
+  R1 <- str_glue("{path_to_fastq}{samples$V3[i]}")
+  R2 <- str_glue("{path_to_fastq}{samples$V4[i]}")
+  output <- str_glue("{path_to_output_dir}/clonosets/{samples$V1[i]}{md}")
+  system(str_glue("java -jar {path_to_mixcr} analyze {preset_analyze}{mode}{tagPattern} {R1} {R2} {output}"))
+}
+
+#generate analyze report from align, refine and assemble reports
+#WARNING! the column names in the exported table are offset by one column to the left (didn't come up with a way to fix that yet)
+run_stats(str_glue("{path_to_output_dir}/export"))
+
+#export .clns into _export.tsv 
+for (i in 1:nrow(samples)) {
+  input <- str_glue("{path_to_output_dir}/clonosets/{samples$V1[i]}{md}.clns")
+  output <- str_glue("{path_to_output_dir}/export/{samples$V1[i]}{md}_export.tsv")
+  system(str_glue("java -jar {path_to_mixcr} exportClones {preset_export} {input} {output}"))
+}
+
+#make .tsv VDJtools friendly
+for (i in 1:nrow(samples)) {
+  rm(ctable)
+  ctable <- read.csv(paste(str_glue("{path_to_output_dir}/export/{samples$V1[i]}{md}_export"), ".tsv", sep = ""), sep = '\t')
+  colnames(ctable) <- c("count", "frequency", "CDR3nt", "CDR3aa", "V", "D", "J", "Vend", "Dstart", "Dend", "Jstart")
+  write.table(ctable, file = paste(str_glue("{path_to_output_dir}/export/{samples$V1[i]}{md}_export"), ".txt", sep = ""), sep = '\t', quote = FALSE, row.names = FALSE, col.names = TRUE)
+}
+
+#compute basic statistics and create a joint file for all samples 
+for (i in 1:nrow(samples)) {
+  system(str_glue("java -jar {path_to_vdj} CalcBasicStats {path_to_output_dir}/export/{samples$V1[i]}{md}_export.txt {path_to_output_dir}/{samples$V1[i]}/{samples$V1[i]}{md}"))
+}
+rm(stats)
+for (i in 1:nrow(samples)) {
+  if (i == 1) {
+    stats <- read.table(str_glue("{path_to_output_dir}/export/{samples$V1[i]}{md}.basicstats.txt"), sep = '\t', header = TRUE)
+  } else {
+    stats <- rbind(read.table(str_glue("{path_to_output_dir}/export/{samples$V1[i]}{md}.basicstats.txt"), sep = '\t', header = TRUE), stats)
+  }
+}
+stats$metadata_blank <- NULL
+write.table(stats, file = str_glue("{path_to_output_dir}basic_stats.tsv"), quote = F, sep = '\t', row.names = F, col.names = T)
+```
+
+MiXCR downsampling and postanalysis
+```{r}
+random_UMI <- 40000
+downsample_mode <- str_glue("top-UMI-fixed {random_UMI}")
+
+#create downsampled .clns files
+for (i in 1:nrow(samples)) {
+  input <- str_glue("{path_to_output_dir}/downsample/{samples$V1[i]}{md}.clns")
+  output <- str_glue("{path_to_output_dir}/downsample/{samples$V1[i]}{md}_r{random_UMI}.clns")
+  system(str_glue("java -jar {path_to_mixcr} downsample --downsampling {downsample_mode} {input} {output}"))
+}
+
+#export .clns into _export.tsv 
+for (i in 1:nrow(samples)) {
+  input <- str_glue("{path_to_output_dir}/downsample/{samples$V1[i]}{md}_r{random_UMI}.clns")
+  output <- str_glue("{path_to_output_dir}/export/{samples$V1[i]}{md}_r{random_UMI}_export.tsv")
+  system(str_glue("java -jar {path_to_mixcr} exportClones {preset_export} {input} {output}"))
+}
+
+#create VDJtools friendly .txt
+for (i in 1:nrow(samples)) {
+  rm(ctable)
+  ctable <- read.csv(paste(str_glue("{path_to_output_dir}/export/{samples$V1[i]}{md}_r{random_UMI}_export"), ".tsv", sep = ""), sep = '\t')
+  colnames(ctable) <- c("count", "frequency", "CDR3nt", "CDR3aa", "V", "D", "J", "Vend", "Dstart", "Dend", "Jstart")
+  write.table(ctable, file = paste(str_glue("{path_to_output_dir}/export/{samples$V1[i]}{md}_r{random_UMI}_export"), ".txt", sep = ""), sep = '\t', quote = FALSE, row.names = FALSE, col.names = TRUE)
+}
+
+#preform postanalysis on downsampled .clns
+for (i in 1:nrow(samples)) {
+  input <- str_glue("{path_to_output_dir}/downsample")
+  output <- str_glue("{path_to_output_dir}/downsample/result.json")
+  system(str_glue("java -jar {path_to_mixcr} postanalysis individual --default-downsampling none --default-weight-function UMI --only-productive --drop-outliers --chains TRB {input} {output}"))
+}
+
+vFamilyUsage <- fread(str_glue("{path_to_output_dir}/downsample/result.vFamilyUsage.TRB.tsv"))
+colnames(vFamilyUsage)[1] <- "library_ID"
+vFamilyUsage$library_ID <- str_split_i(vFamilyUsage$library_ID, pattern = ".TRB", i = 1)
+vFamilyUsage$library_ID <- gsub(vFamilyUsage$library_ID, pattern = "_T2", replacement = "")
+vFamilyUsage <- apply(vFamilyUsage, c(1,2), function(x) gsub(pattern = "null", replacement = "0", x)) %>% as.data.frame()
+
+jFamilyUsage <- fread(str_glue("{path_to_output_dir}/downsample/result.jFamilyUsage.TRB.tsv"))
+colnames(jFamilyUsage)[1] <- "library_ID"
+jFamilyUsage$library_ID <- str_split_i(jFamilyUsage$library_ID, pattern = ".TRB", i = 1)
+jFamilyUsage$library_ID <- gsub(jFamilyUsage$library_ID, pattern = "_T2", replacement = "")
+jFamilyUsage <- apply(jFamilyUsage, c(1,2), function(x) gsub(pattern = "null", replacement = "0", x)) %>% as.data.frame()
+
+cdr3metrics <- fread("{path_to_output_dir}/downsample/result.cdr3metrics.TRB.tsv")
+colnames(cdr3metrics)[1] <- "library_ID"
+cdr3metrics$library_ID <- str_split_i(cdr3metrics$library_ID, pattern = ".TR", i = 1)
+cdr3metrics$library_ID <- gsub(cdr3metrics$library_ID, pattern = "_T2", replacement = "")
+
+diversity <- fread("{path_to_output_dir}/downsample/result.diversity.TRB.tsv")
+colnames(diversity)[1] <- "library_ID"
+diversity$library_ID <- str_split_i(diversity$library_ID, pattern = ".TR", i = 1)
+diversity$library_ID <- gsub(diversity$library_ID, pattern = "_T2", replacement = "")
+
+samples_table <- samples %>% select("Library")
+#OR
+samples_table <- cdr3metrics %>% select("library_ID")
+
+colnames(samples_table) <- "library_ID"
+samples_table$group <- str_split_i(samples_table$library_ID, pattern = "_", i = 1)
+samples_table$donor_ID <- paste(str_split_i(samples_table$library_ID, pattern = "_", i = 1), str_split_i(samples_table$library_ID, pattern = "_", i = 2), sep = "_")
+samples_table$sample_ID <- str_split_i(samples_table$library_ID, pattern = "_n", i = 1)
+samples_table$point <- str_split_i(samples_table$sample_ID, pattern = "_", i = 3)
+samples_table[which(is.na(samples_table$point)), ]$point <- samples_table[which(is.na(samples_table$point)), ]$group
+samples_table$replica <- str_split_i(samples_table$library_ID, pattern = "_n", i = 2)
+
+samples_table <- full_join(samples_table, vFamilyUsage, join_by(library_ID))
+samples_table <- full_join(samples_table, jFamilyUsage, join_by(library_ID))
+samples_table <- full_join(samples_table, cdr3metrics, join_by(library_ID))
+samples_table <- full_join(samples_table, diversity, join_by(library_ID))
+
+diversity_table_long <- samples_table[, c(1:6, 36:52)] %>% 
+  pivot_longer(colnames(samples_table)[36:52], names_to = "metric", values_to = "value")
+vFamilyUsage_long <- samples_table[, c(1:33)] %>% 
+  pivot_longer(colnames(samples_table)[7:33], names_to = "Vgene", values_to = "frequency")
+jFamilyUsage_long <- samples_table[, c(1:6, 34:35)] %>% 
+  pivot_longer(colnames(samples_table)[34:35], names_to = "Jgene", values_to = "frequency")
+
+ggplot() + 
+  scale_fill_manual(values=c("#cfdfe2", "#d9d2e9", "#ead1db")) +
+  geom_point(data = diversity_table_long, mapping = aes(x = point, y = value, colour = donor_ID)) + 
+  geom_line(data = diversity_table_long, mapping = aes(x = point, y = value, color = donor_ID, group = donor_ID)) +
+  facet_wrap(.~metric, scales = "free_y") +
+  theme(axis.text=element_text(size=12))
+
+ggplot() + 
+  scale_fill_manual(values=c("#cfdfe2", "#d9d2e9", "#ead1db")) +
+  geom_boxplot(data = vFamilyUsage_long, mapping = aes(x = point, y = frequency, fill = group)) +
+  facet_wrap(.~Vgene, scales = "free_y") +
+  theme(axis.text=element_text(size=5))
+
+ggplot() + 
+  scale_fill_manual(values=c("#cfdfe2", "#d9d2e9", "#ead1db")) +
+  geom_boxplot(data = jFamilyUsage_long, mapping = aes(x = point, y = frequency, fill = group)) +
+  facet_wrap(.~Jgene, scales = "free_y") +
+  theme(axis.text=element_text(size=5))
+
+```
+
+Add patient info
+```{r}
+patient_info <- fread("/home/user/patient_info.csv")[1:54,]
+
+patient_data <- patient_info %>% mutate(sample_ID = paste(paste("group_", Donor_ID, sep = ""), point, sep = "_")) %>% select(-c("Donor_ID", "point"))
+samples_table <- full_join(samples_table, patient_data, join_by(sample_ID), multiple = "all")
+```
+
+Add FACS data
+```{r}
+FACS_table <- fread("/home/user/FACS.csv")
+colnames(FACS_table)[1] <- "sample_ID"
+FACS_table <- FACS_table %>% mutate(sample_ID = str_split_i(sample_ID, pattern = ".f", i = 1))
+FACS_table <- FACS_table %>% mutate(type = str_split_i(sample_ID, pattern = " ", i = 2))
+FACS_table <- FACS_table %>% mutate(sample_ID = str_split_i(sample_ID, pattern = " ", i = 1))
+FACS_table <- FACS_table %>% mutate(group = str_split_i(sample_ID, pattern = "_", i = 1))
+FACS_table <- FACS_table %>% mutate(donor = paste(str_split_i(str_split_i(sample_ID, pattern = " ", i = 1), pattern = "_", i = 1), str_split_i(str_split_i(sample_ID, pattern = " ", i = 1), pattern = "_", i = 2), sep = "_"))
+FACS_table <- FACS_table %>% mutate(point = str_split_i(str_split_i(sample_ID, pattern = "_", i = 3), pattern = " ", i = 1))
+FACS_table[which(is.na(point))]$point <- FACS_table[which(is.na(point))]$group
+
+samples_table <- full_join(samples_table, FACS_table[, -c("point", "group", "donor")], join_by(sample_ID), multiple = "all")
+```
+
+Add HLA data
+```{r}
+HLA <- read.csv("/home/user/HLA.csv")[, -(2:5)]
+colnames(HLA)[1] <- "donor_ID"
+for (r in 1:nrow(HLA)) {
+  for (c in 2:ncol(HLA)) {
+    if (is.na(HLA[r, c])) {
+    } else {
+      list <- strsplit(HLA[r, c], split = " ")
+      for (i in length(list)) {
+        list[[1]][i] <- paste(str_split_i(list[[1]][i], pattern = ":", i = 1), str_split_i(as.data.frame(list)[[1]][i], pattern = ":", i = 2), sep = ":")
+      }
+      list_table <- table(list[[1]])
+      if (sum(list_table == as.data.frame(list_table)[which.max(list_table), 2]) > 1) {
+        for (n in 1:length(list[[1]])) {
+          list[[1]][n] <- paste(strsplit(list[[1]][n], split = ":")[[1]][1], strsplit(list[[1]][n], split = ":")[[1]][2], sep = ":")
+        }
+        list_table <- table(list[[1]])
+      }
+      list_table <- as.data.frame(list_table)
+      HLA[r, c] <- as.character(list_table$Var1[which.max(list_table$Freq)])
+    }
+  }
+}
+
+HLA_useful <- HLA[,c(1, 10:16, 18:21, 24:25)]
+
+frequency <- as.data.frame(table(unlist(HLA_useful[,-1])))[order(as.data.frame(table(unlist(HLA_useful[,-1])))$Freq, decreasing = TRUE),]
+
+HLA1 <- HLA_useful[apply(HLA_useful, 1, function(r) any(r %in% c("DRB1*03:01"))), ][,1]
+
+HLA_groups <- as.data.frame(HLA_useful[,1])
+colnames(HLA_groups) <- "donor"
+HLA_groups$"DRB1*03:01+" <- apply(HLA_groups, 1, function(r) any(r %in% HLA1))
+
+samples_table <- full_join(samples_table, HLA_useful, join_by(donor_ID), multiple = "all")
+
+```
+
+Preparing data for ALICE
+```{r}
+metadata <- as.data.frame(samples_table[, "library_ID"])
+#OR
+metadata <- read.csv("/home/user/metadata.csv")
+metadata <- metadata %>% mutate(sample = gsub(metadata$sample, pattern = ".clns", replacement = ""))
+metadata <- metadata %>% mutate(library_ID = gsub(metadata$sample, pattern = "_T2", replacement = ""))
+
+
+alice_samples <- list()
+colnames <- c("Read.count", "Read.proportion", "CDR3.nucleotide.sequence", "CDR3.amino.acid.sequence", "bestVGene", "bestDGene", "bestJGene", "Vend", "Dstarts", "Dend", "Jstart")
+
+for (i in 1:nrow(metadata)) {
+  sample <- metadata[i, "sample"]
+  name <- metadata[i, "library_ID"]
+  data <- fread(str_glue("{path_to_output_dir}/export/{sample}_export.txt"))
+  colnames(data) <- colnames
+  data$bestVGene <- gsub("\\*.*$", "", data$bestVGene)
+  data$bestJGene <- gsub("\\*.*$", "", data$bestJGene)
+  data$bestDGene <- gsub("\\*.*$", "", data$bestDGene)
+  data$Rank <- c(1:nrow(data))
+  data <- data[, c(12, 1, 2, 3, 4, 5, 7)]
+  data <- list(data)
+  alice_samples <- c(alice_samples, data)
+  names(alice_samples)[i] <- str_glue("{name}")
+}
+
+
+repertoires <- as.data.frame(matrix(nrow = 0, ncol = 11))
+names(repertoires) <- c("count", "frequency", "CDR3nt", "CDR3aa", "V", "D", "J", "Vend", "Dstart", "Dend", "Jstart")
+colnames <- c("count", "frequency", "CDR3nt", "CDR3aa", "V", "D", "J", "Vend", "Dstart", "Dend", "Jstart")
+
+for (i in 1:nrow(metadata)) {
+  sample <- metadata[i, "sample"]
+  name <- metadata[i, "library_ID"]
+  data <- fread(str_glue("{path_to_output_dir}/export/{sample}_export.txt"))
+  colnames(data) <- colnames
+  data$library_ID <- str_glue("{name}")
+  data$bestVGene_no_allele <- gsub("\\*.*$", "", data$V)
+  data$bestJGene_no_allele <- gsub("\\*.*$", "", data$J)
+  data$bestDGene_no_allele <- gsub("\\*.*$", "", data$D)
+  repertoires <- rbind(repertoires, data)
+}
+```
+
+ALICE with OLGA
+```{r}
+setwd("/home/user/ALICE-master")
+Sys.getenv()
+Sys.setenv(PATH="#Copy PATH from the output of Sys.getenv() and add :/home/user/path_to_OLGA at the end")
+source("ALICE.R")
+min_reads_per_clonotype <- 0
+min_reads_per_neighbour <- 1
+
+for (i in 1:length(alice_samples)) {
+  try({
+    ALICE_sample <- ALICE_pipeline_OLGA(DTlist=alice_samples[i],cor_method="BH",cores=1,qL=F,Read_count_filter=min_reads_per_clonotype,Read_count_neighbour=min_reads_per_neighbour) 
+    write.csv(sample, str_glue("{path_to_output_dir}/ALICE_OLGA_hits_{names(alice_samples)[i]}_{min_reads_per_clonotype}_{min_reads_per_neighbour}.csv"))
+  }, silent = TRUE)
+}
+
+OLGA_names <- c("Rank", "Read.count", "Read.proportion", "CDR3.nucleotide.sequence", "CDR3.amino.acid.sequence", "bestVGene", "bestJGene", "D", "n_total", "ind", "Pgen", "Pgen1", "Pgen3", "space", "space_n", "p_val", "sample_ID")
+ALICE_OLGA_samples <- as.data.frame(matrix(nrow = 0, ncol = 17))
+names(ALICE_OLGA_samples) <- OLGA_names
+nrow(ALICE_OLGA_samples)
+
+for (i in 1:length(names(alice_samples))) {
+  try({
+    sample <- read.csv(str_glue("{path_to_output_dir}/ALICE_OLGA_hits_{names(alice_samples)[i]}_{min_reads_per_clonotype}_{min_reads_per_neighbour}.csv"), header = TRUE)
+    sample <- sample[, -1]
+    sample$library_ID <- str_glue("{names(alice_samples)[i]}")
+    ALICE_OLGA_samples <- rbind(ALICE_OLGA_samples, setNames(sample, OLGA_names))
+  }, silent = TRUE)
+}
+
+ALICE_OLGA_samples <- ALICE_OLGA_samples %>% mutate(donor_ID = paste(str_split_i(ALICE_OLGA_samples$library_ID, pattern = "_", i = 1), str_split_i(ALICE_OLGA_samples$library_ID, pattern = "_", i = 2), sep = "_"))
+ALICE_OLGA_samples <- ALICE_OLGA_samples %>% mutate(clonotype = str_glue("{ALICE_OLGA_samples$CDR3.amino.acid.sequence}_{ALICE_OLGA_samples$bestVGene}_{ALICE_OLGA_samples$bestJGene}"))
+ALICE_OLGA_samples <- ALICE_OLGA_samples %>% mutate(group = str_split_i(ALICE_OLGA_samples$library_ID, pattern = "_", i = 1))
+
+setwd("/home/user/")
+write.csv(ALICE_OLGA_samples, str_glue("{path_to_output_dir}/ALICE_OLGA_samples_{min_reads_per_clonotype}_{min_reads_per_neighbour}.csv"))
+```
+
+Classic ALICE
+```{r}
+setwd("/home/user/ALICE-master")
+source("ALICE.R")
+min_reads_per_clonotype <- 0
+min_reads_per_neighbour <- 1
+
+for (i in 1:length(alice_samples_classic)) {
+  ALICE_sample <- ALICE_pipeline(DTlist=alice_samples,folder="alice_res",cores=30,iter=5,nrec=1e6,P_thres=0.001,cor_method="BH",qL=F,Read_count_filter=min_reads_per_clonotype,Read_count_neighbour=min_reads_per_neighbour) 
+  write.csv(ALICE_sample[i], str_glue("{path_to_output_dir}/ALICE_classic_hits_{names(alice_samples)[i]}_{min_reads_per_clonotype}_{min_reads_per_neighbour}.csv"))
+}
+
+classic_names <- c("Rank", "Read.count", "Read.proportion", "CDR3.nucleotide.sequence", "CDR3.amino.acid.sequence", "bestVGene", "bestJGene", "D", "total_n", "space", "space_n", "q", "p_val", "sample_ID")
+ALICE_classic_samples <- as.data.frame(matrix(nrow = 0, ncol = 14))
+names(ALICE_classic_samples) <- classic_names
+
+for (i in 1:length(alice_samples)) {
+  try({
+    sample <- read.csv(str_glue("{path_to_output_dir}/ALICE_classic_hits_{names(alice_samples)[i]}_{min_reads_per_clonotype}_{min_reads_per_neighbour}.csv"), header = TRUE)
+    sample <- sample[, -1]
+    sample$sample_ID <- str_glue("{names(alice_samples)[i]}")
+    ALICE_classic_samples <- rbind(ALICE_classic_samples, setNames(sample, classic_names))
+  }, silent = TRUE)
+}
+
+ALICE_classic_samples <- ALICE_classic_samples %>% mutate(donor_ID = paste(str_split_i(ALICE_classic_samples$library_ID, pattern = "_", i = 1), str_split_i(ALICE_classic_samples$library_ID, pattern = "_", i = 2), sep = "_"))
+ALICE_classic_samples <- ALICE_classic_samples %>% mutate(clonotype = str_glue("{ALICE_classic_samples$CDR3.amino.acid.sequence}_{ALICE_classic_samples$bestVGene}_{ALICE_classic_samples$bestJGene}"))
+
+setwd("/home/user/")
+write.csv(ALICE_classic_samples, str_glue("{path_to_output_dir}/ALICE_classic_samples_{min_reads_per_clonotype}_{min_reads_per_neighbour}.csv"))
+```
+
+Clustering and cluster analysis 
+```{r}
+ALICE_OLGA_samples <- Lupus_samples_OLGA_0_0
+colnames(ALICE_OLGA_samples)[which(colnames(ALICE_OLGA_samples)=="sample_ID")] <- "library_ID"
+ALICE_OLGA_samples <- ALICE_OLGA_samples %>% mutate(library_ID = gsub(library_ID, pattern = "_T2", replacement = ""))
+
+find_pairs <- function(clonoset) {
+  result <- as.data.frame(matrix(nrow = 0, ncol = 2))
+  colnames(result) <- c("from.cdr3", "to.cdr3")
+  n <- nrow(clonoset)
+  to_check <- rep(TRUE, n)
+  try({for (v in 1:n) {
+    if (to_check[v]) {
+      to_check[v] <- FALSE
+      V_current <- clonoset$bestVGene[v]
+      candidates <- clonoset[to_check & clonoset$bestVGene == V_current, ] %>% select(c("CDR3.amino.acid.sequence", "bestVGene", "bestJGene", "clonotype"))
+      J_current <- clonoset$bestJGene[v]
+      candidates <- candidates[candidates$bestJGene == J_current,]
+      if (nrow(candidates) != 0) {
+        neighbours <- stringdistmatrix(clonoset$clonotype[v], candidates$clonotype, method = "hamming", useNames = "strings",) %>%
+          melt %>%
+          filter(value %in% c(1)) %>%
+          select(-value)
+        colnames(neighbours) <- c("from.cdr3", "to.cdr3")
+        result <- rbind(result, neighbours)
+        print(v)
+      }
+    }
+  }}, silent = TRUE)
+  result
+}
+
+res_from_find_pairs <- find_pairs(ALICE_OLGA_samples)
+
+graph <- graph_from_data_frame(res_from_find_pairs, directed = F) %>% simplify
+components <- components(graph)
+
+clusters <- as.data.frame(components$membership)
+colnames(clusters) <- "cluster_ID"
+clusters$clonotype <- rownames(clusters)
+
+clonotypes <- ALICE_OLGA_samples %>% select(clonotype, library_ID, donor_ID, group)
+
+clonotypes <- left_join(clusters, clonotypes, join_by(clonotype))
+
+cluster_occurence <- unique(clonotypes[,c('donor_ID','cluster_ID')]) %>% count(cluster_ID)
+colnames(cluster_occurence)[2] <- "cluster_occurence"
+clonotype_occurence <- unique(clonotypes[,c('donor_ID','clonotype')]) %>% count(clonotype)
+colnames(clonotype_occurence)[2] <- "clonotype_occurence"
+
+clonotypes <- left_join(clonotypes, cluster_occurence, join_by(cluster_ID))
+clonotypes <- left_join(clonotypes, clonotype_occurence, join_by(clonotype))
+
+shared_clusters <- clonotypes %>% filter(cluster_occurence>2)
+shared_clusters %>% count(cluster_ID)
+shared_clusters %>% count(donor_ID)
+unique(shared_clusters[, c("donor_ID", "cluster_ID")])[order(unique(shared_clusters[, c("donor_ID", "cluster_ID")])$cluster_ID),] %>% count(donor_ID)
+write.csv(unique(shared_clusters_VJ[, c("clonotype")]), "{path_to_output_dir}/shared_clonotypes.csv")
+
+#Adding vertice characteristics to graph
+vertices <- V(graph)
+vertices_cluster_ID <- NA
+vertices_cluster_occurence <- NA
+vertices_donor_ID <- NA
+vertices_clonotype_occurence <- NA
+for (i in 1:length(vertices)) {
+  vertices_cluster_ID[i] <- clonotypes$cluster_ID[which(clonotypes$clonotype==names(vertices[i]))]
+  vertices_cluster_occurence[i] <- clonotypes$cluster_occurence[which(clonotypes$clonotype==names(vertices[i]))]
+  vertices_donor_ID[i] <- clonotypes$donor_ID[which(clonotypes$clonotype==names(vertices[i]))]
+  vertices_clonotype_occurence[i] <- clonotypes$clonotype_occurence[which(clonotypes$clonotype==names(vertices[i]))]
+}
+
+V(graph)$cluster_ID <- vertices_cluster_ID
+V(graph)$cluster_occurence <- vertices_cluster_occurence
+V(graph)$donor_ID <- vertices_donor_ID
+V(graph)$clonotype_occurence <- vertices_clonotype_occurence
+
+graph_shared <- graph
+graph_shared <- delete_vertices(graph_shared, V(graph_shared)[cluster_occurence < 3])
+
+plot(graph_shared, layout = layout_nicely, vertex.label = NA, edge.color = 'gray', vertex.color = as.factor(V(gg_shared_VJ)$cluster_ID), edge.width = 3, rescale=T, vertex.size = V(gg_shared_VJ)$clonotype_occurence*3)
+
+#Finding group-specific clusters
+clusters_by_group <- unique(shared_clusters[, c("group", "cluster_ID")]) %>% .[order(.$cluster_ID), ]
+clusters_group <- as.data.frame(unique(shared_clusters[, c("cluster_ID")]))
+colnames(clusters_group) <- "cluster_ID"
+clusters_group$HD <- NA
+clusters_group$Lup <- NA
+clusters_group$RA <- NA
+for (i in 1: nrow(clusters_group)) {
+  ifelse ("HD" %in% clusters_by_group$group[which(clusters_by_group$cluster_ID == clusters_group$cluster_ID[i])], clusters_group$HD[i] <- TRUE, clusters_group$HD[i] <- FALSE)
+  ifelse ("Lup" %in% clusters_by_group$group[which(clusters_by_group$cluster_ID == clusters_group$cluster_ID[i])], clusters_group$Lup[i] <- TRUE, clusters_group$Lup[i] <- FALSE)
+  ifelse ("RA" %in% clusters_by_group$group[which(clusters_by_group$cluster_ID == clusters_group$cluster_ID[i])], clusters_group$RA[i] <- TRUE, clusters_group$RA[i] <- FALSE)
+}
+
+#Consensus sequence logos for shared clusters 
+shared_clusters_aa <- shared_clusters %>% select(c("clonotype", "cluster_ID")) %>% mutate(clonotype = str_split_i(.$clonotype, pattern = "_", i = 1))
+colnames(shared_clusters_aa) <- c("aa_seq", "cluster_ID")
+shared_clusters_aa_list <- list()
+for (i in 1:length(unique(shared_clusters_aa$cluster_ID))) {
+  shared_clusters_aa_list[i] <- shared_clusters_aa %>% filter(cluster_ID == unique(shared_clusters_aa$cluster_ID)[i]) %>% select("aa_seq")
+  names(shared_clusters_aa_list)[i] <- unique(shared_clusters_aa$cluster_ID)[i]
+}
+
+ggseqlogo(shared_clusters_aa_list, facet = "wrap", ncol = 2, method = 'prob')
+
+#Shared cluster VJ usage table
+cluster_VJ_usage <- shared_clusters %>% select(c("clonotype", "cluster_ID")) %>% mutate(paste(str_split_i(.$clonotype, pattern = "_", i = 2), str_split_i(.$clonotype, pattern = "_", i = 3), sep = " "))
+cluster_VJ_usage <- unique(cluster_VJ_usage[, -1])
+
+#Cluster clonotypes in donors
+donors_clonotypes <- unique(clonotypes[,c('donor_ID','cluster_ID')])
+          
+
+#Searching for shared cluster clonotypes in the full repertoires
+#backup <- repertoires
+#repertoires <- backup
+
+repertoires <- repertoires %>% mutate(clonotype = str_glue("{repertoires$CDR3aa}_{repertoires$bestVGene_no_allele}_{repertoires$bestJGene_no_allele}"))
+repertoires <- full_join(repertoires, clonotypes[, c("clonotype", "cluster_ID", "cluster_occurence", "clonotype_occurence")], join_by(clonotype), multiple = "all", relationship = "many-to-many")
+repertoires <- repertoires %>% mutate(donor_ID = paste(str_split_i(repertoires$library_ID, pattern = "_", i = 1), str_split_i(repertoires$library_ID, pattern = "_", i = 2), sep = "_"))
+repertoires <- repertoires %>% mutate(group = str_split_i(repertoires$library_ID, pattern = "_", i = 1))
+repertoires <- unique(repertoires)
+repertoires_clusters <- repertoires[which(!(is.na(repertoires$cluster_ID))),]
+
+#Calculated CDR3aa clonotype frequencies (initial data has CDR3nc clonotype frequencies)
+repertoires_clonotypes <- as.data.frame(matrix(nrow = 0, ncol = 21))
+colnames(repertoires_clonotypes) <- colnames(repertoires_filtered)
+for (i in 1:nrow(unique(repertoires_filtered[, c("clonotype", "library_ID")]))) {
+  selected <- repertoires_filtered[intersect(which(repertoires_filtered$clonotype == as.character(unique(repertoires_filtered[, c("clonotype", "library_ID")])[i, 1])), which(repertoires_filtered$library_ID == as.character(unique(repertoires_filtered[, c("clonotype", "library_ID")])[i, 2]))), ]
+  selected_sum <- selected[1, ]
+  selected_sum$frequency <- sum(selected$frequency)
+  selected_sum$count <- sum(selected$count)
+  repertoires_clonotypes <- rbind(repertoires_clonotypes, selected_sum)
+  print(i)
+}
+
+ggplot(data = repertoires_clonotypes[which(repertoires_clonotypes$cluster_occurence>2), ], mapping = aes(x = donor_ID, y = as.numeric(frequency), fill = group)) + 
+  scale_fill_manual(values=c("#cfdfe2", "#d9d2e9", "#ead1db")) +
+  theme(axis.text.x = element_text(angle = 90)) +
+  geom_boxplot() +
+  geom_point() +
+  facet_wrap(.~cluster_ID, scales = "free_y")
+```
+
+VDJDB
+```{r}
+shared_clonotypes_list <- unique(shared_clusters$clonotype)
+shared_clonotypes_table <- as.data.frame(matrix(nrow = length(shared_clonotypes_list), ncol = 0))
+shared_clonotypes_table$clonotype <- shared_clonotypes_list
+shared_clonotypes_table <- shared_clonotypes_table %>% mutate(CDR3aa = str_split_i(shared_clonotypes_table$clonotype, pattern = "_", i = 1))
+shared_clonotypes_table <- shared_clonotypes_table %>% mutate(V = str_split_i(shared_clonotypes_table$clonotype, pattern = "_", i = 2))
+shared_clonotypes_table <- shared_clonotypes_table %>% mutate(J = str_split_i(shared_clonotypes_table$clonotype, pattern = "_", i = 3))
+
+
+vdjmatch_samples <- repertoires[which(repertoires$CDR3aa %in% shared_clonotypes_table$CDR3aa), ]
+vdjmatch_samples <- vdjmatch_samples[which(vdjmatch_samples$clonotype %in% shared_clonotypes_table$clonotype), ]
+vdjmatch_samples_needed <- vdjmatch_samples[, 1:12]
+
+write.table(vdjmatch_samples_needed, str_glue("{path_to_output_dir}/vdjmatch.txt"), sep = "\t", quote = FALSE, row.names = FALSE)
+
+system(str_glue("java -jar {path_to_vdj_match} match -S human -R TRB -O 1,0,1 --v-match --j-match --min-epi-size 10 {path_to_output_dir}/vdjmatch.txt {path_to_output_dir}/vdjdb_result"))
+
+
+vdjdb <- fread(str_glue("{path_to_output_dir}/vdjdb_result.vdjmatch.txt", sep = "\t"))
+
+#Continue working from here
+
+vdjdb <- vdjdb %>% mutate(clonotype = str_glue("{cdr3aa}_{v}_{j}"))
+vdjdb <- vdjdb %>% mutate(donor_ID = paste(str_split_i(library_ID, pattern = "_", i = 1), str_split_i(library_ID, pattern = "_", i = 2), sep = "_"))
+vdjdb$HLA_match <- NA
+for (i in 1:nrow(vdjdb)) {
+  vdjdb$HLA_match[i] <- ifelse(ifelse(is.na(str_split_i(vdjdb$mhc.a[i], pattern = "-", i = 2)), "---", str_split_i(vdjdb$mhc.a[i], pattern = "-", i = 2)) %in% HLA[which(HLA$donor_ID==vdjdb$donor_ID[i]), -(1)] | ifelse(is.na(str_split_i(vdjdb$mhc.b[i], pattern = "-", i = 2)), "---", str_split_i(vdjdb$mhc.b[i], pattern = "-", i = 2)) %in% HLA[which(HLA$donor_ID==vdjdb$donor_ID[i]), -(1)], TRUE, FALSE)
+}
+vdjdb <- vdjdb[which(HLA_match == TRUE)]
+
+vdjdb_good <- vdjdb[which(vdjdb$vdjdb.score>0)]
+nrow(vdjdb_good)
+
+vertices_antigen <- " "
+for (i in 1:length(vertices)) {
+  vertices_antigen[i] <- clonotypes$antigen[which(clonotypes$clonotype==names(vertices[i]))]
+  if (is.na(vertices_antigen[i])) {
+    vertices_antigen[i] <- " "
+  }
+}
+V(graph)$antigen <- vertices_antigen
+
+clonotypes <- left_join(clonotypes, vdjdb[, c("antigen.species", "clonotype")], join_by(clonotype), relationship = "many-to-many")
+clonotypes_VJ %>% count(antigen)
+```
+
+HLA and repertoire intersections
+```{r}
+alice_samples
+
+samples_for_intersection <- alice_samples[which(sapply(alice_samples, nrow) >= 7500)]
+names(samples_for_intersection) <- gsub(names(samples_for_intersection), pattern = "_T2", replacement = "")
+samples_for_intersection_names <- as.data.frame(names(samples_for_intersection))
+colnames(samples_for_intersection_names) <- "names"
+samples_for_intersection_names <- samples_for_intersection_names %>% mutate(sample = paste(str_split_i(names, pattern = "_", 1), str_split_i(names, pattern = "_", 2), sep = "_"))
+chosen <- vector()
+for(i in 1:length(unique(samples_for_intersection_names$sample))) {
+  candidate_samples <- samples_for_intersection_names[which(samples_for_intersection_names$sample == unique(samples_for_intersection_names$sample)[i]), ]
+  chosen[i] <- candidate_samples[sample(1:nrow(candidate_samples), 1), 1]
+}
+samples_for_intersection <- samples_for_intersection[chosen]
+
+intersection_samples <- list()
+for (i in 1:length(samples_for_intersection)) {
+  intersection_samples[i] <- samples_for_intersection[i]
+  intersection_samples[i] <- intersection_samples[i][order("Read.proportion", decreasing = TRUE)]
+  intersection_samples[[i]] <- intersection_samples[[i]][1:7500]
+  intersection_samples[[i]] <- intersection_samples[[i]] %>% mutate(clonotype = str_glue("{intersection_samples[[i]]$CDR3.amino.acid.sequence}_{intersection_samples[[i]]$bestVGene}_{intersection_samples[[i]]$bestJGene}"))
+  names(intersection_samples)[i] <- names(samples_for_intersection)[i]
+}
+
+sapply(intersection_samples, nrow)
+
+intersections <- as.data.frame(matrix(nrow=0, ncol=3))
+colnames(intersections) <- c("sample1", "sample2", "intersections")
+intersections_results <- intersections
+for (r in 1:length(intersection_samples)) {
+  for (c in r:length(intersection_samples)) {
+    intersections[1, 1] <- str_glue("{names(intersection_samples)[r]}")
+    intersections[1, 2] <- str_glue("{names(intersection_samples)[c]}")
+    try(intersections[1, 3] <- nrow(inner_join(intersection_samples[[r]][, "clonotype"], intersection_samples[[c]][, "clonotype"], join_by(clonotype), unmatched = "drop")), silent = TRUE)
+    intersections_results <- rbind(intersections_results, intersections)
+    print(str_glue("{r}, {c}"))
+  }
+}
+
+intersections_results <- intersections_results[which(intersections_results$sample1!=intersections_results$sample2),]
+
+intersections_results <- intersections_results %>% mutate(donor_ID1 = paste(str_split_i(intersections_results$sample1, pattern = "_", i = 1), str_split_i(intersections_results$sample1, pattern = "_", i = 2), sep = "_"))
+intersections_results <- intersections_results %>% mutate(donor_ID2 = paste(str_split_i(intersections_results$sample2, pattern = "_", i = 1), str_split_i(intersections_results$sample2, pattern = "_", i = 2), sep = "_"))
+
+intersections_results <- intersections_results[which(intersections_results$donor_ID1!=intersections_results$donor_ID2),]
+
+write.csv(intersections_results, str_glue("{path_to_output_dir}/intersections_table.csv"))
+
+frequency_seq <- as.data.frame(table(unlist(HLA_useful[c(1, 4, 8, 9, 10, 13, 15, 16, 18, 21, 22, 29), -1])))[order(as.data.frame(table(unlist(HLA_useful[c(1, 4, 8, 9, 10, 13, 15, 16, 18, 21, 22, 29), -1])))$Freq, decreasing = TRUE),]
+frequency <- as.data.frame(table(unlist(HLA_useful[,-1])))[order(as.data.frame(table(unlist(HLA_useful[,-1])))$Freq, decreasing = TRUE),] %>% filter(Freq > 3)
+
+matching_HLA <- HLA_useful %>% t()
+matches <- as.data.frame(matrix(ncol = 4, nrow = 0))
+try({
+  for (i in 1:ncol(matching_HLA)) {
+    donor1 <- matching_HLA[1, i]
+    for (n in 1:ncol(matching_HLA)) {
+      donor2 <- matching_HLA[1, n]
+      common_elements <- intersect(matching_HLA[-1, i], matching_HLA[-1, n])
+      common_elements <- common_elements[!is.na(common_elements)]
+      matches <- rbind(matches, c(str_glue("{donor1}"), str_glue("{donor2}"), str_glue("{length(common_elements)}"), str_glue("{paste(common_elements, collapse=' ')}")))
+      colnames(matches) <- c("donor1", "donor2", "n", "matches")
+    }
+  }
+}, silent = TRUE)
+
+
+matches <- matches[which(matches$donor1 != matches$donor2), ]
+matches <- matches[order(matches$n, decreasing = TRUE),  ]
+matches_seq <- matches[which(matches$donor1 %in% unique(intersections_results$donor_ID1) & matches$donor2 %in% unique(intersections_results$donor_ID1)), ]
+
+intersections_results$matches <- NA
+intersections_results$matching_alleles <- NA
+for (i in 1:nrow (intersections_results)) {
+  try(intersections_results$matches[i] <- matches_seq$n[which((intersections_results$donor_ID1[i] == matches_seq$donor1 & intersections_results$donor_ID2[i] == matches_seq$donor2) | (intersections_results$donor_ID2[i] == matches_seq$donor1 & intersections_results$donor_ID1[i] == matches_seq$donor2))], silent = TRUE)
+  try(intersections_results$matching_alleles[i] <- matches_seq$matches[which((intersections_results$donor_ID1[i] == matches_seq$donor1 & intersections_results$donor_ID2[i] == matches_seq$donor2) | (intersections_results$donor_ID2[i] == matches_seq$donor1 & intersections_results$donor_ID1[i] == matches_seq$donor2))], silent = TRUE)
+}
+
+intersections_results_matches <- na.omit(intersections_results)
+
+intersections_results_matches %>% count(matches)
+
+ggplot(data = intersections_results_matches, mapping = aes(x = matches, y = intersections)) + 
+  geom_boxplot(fill = "#d6a7bd") 
+
+for (i in 0:5) {
+  intersections_results_matches_norm <- intersections_results_matches %>% filter(matches == i)
+  if (nrow(intersections_results_matches_norm) > 50) {
+    norm <- ks.test(intersections_results_matches_norm$intersections, "pnorm", mean=mean(intersections_results_matches_norm$intersections), sd=sd(intersections_results_matches_norm$intersections))
+  } else {
+    norm <- shapiro.test(intersections_results_matches_norm$intersections)
+  }
+  print(str_glue("{i} match: {ifelse(norm$p.value < 0.05, 'not normal', 'normal')}"))
+}
+
+results <- data.frame(matrix(nrow = 0, ncol = 3))
+try({
+  for (i in 0:5) {
+    intersections_results_matches_norm_i <- intersections_results_matches %>% filter(matches == i)
+    for (n in (i+1):5) {
+      intersections_results_matches_norm_n <- intersections_results_matches %>% filter(matches == n)
+      test <- wilcox.test(x = intersections_results_matches_norm_i$intersections, y = intersections_results_matches_norm_n$intersections, alternative = "two.sided", exact = FALSE)
+      results <- rbind(results, c(i, n, test$p.value))
+      colnames(results) <- c("matches1", "matches2", "p_value")
+    }
+  }
+}, silent = TRUE)
+
+results_significant <- results %>% filter(p_value < 1-(1-0.05)^(1/nrow(results)))
+
+#DRB1*1501/DQB1*0602 (DR2) 
+#DRB1*0301/DQB1*0201 (DR3)
+#DRB1*15:01 DRB5*01:01 DQA1*01:02 DQB1*06:02
+
+allele_vs_intersection <- as.data.frame(matrix(nrow = 0, ncol = 8))
+colnames(allele_vs_intersection) <- c("HLA_allele", "matches", "n_TRUE", "n_FALSE", "mean in positive", "mean in negative", "p_value", "test_name")
+allele_vs_intersection_significant <- as.data.frame(matrix(nrow = 0, ncol = 9))
+colnames(allele_vs_intersection_significant) <- c("sample1", "sample2", "intersections", "donor_ID1", "donor_ID2", "matches", ",matching_alleles", "allele", "check")
+frequency <- as.data.frame(table(unlist(HLA_useful[,-1])))[order(as.data.frame(table(unlist(HLA_useful[,-1])))$Freq, decreasing = TRUE),] %>% filter(Freq > 3)
+for (i in 1:nrow(frequency)) {
+  try({
+    chosen_allele <- intersections_results_matches
+    chosen_allele$allele <- grepl(pattern = paste(str_split_i(frequency$Var1[i], pattern = '\\*', i = 1), str_split_i(frequency$Var1[i], pattern = '\\*', i = 2), sep = "\\*"), x = intersections_results_matches$matching_alleles)
+    n_min <- as.numeric(min(intersections_results_matches[grepl(pattern = paste(str_split_i(frequency$Var1[i], pattern = '\\*', i = 1), str_split_i(frequency$Var1[i], pattern = '\\*', i = 2), sep = "\\*"), x = intersections_results_matches$matching_alleles), ]$matches))
+    n_max <- as.numeric(max(intersections_results_matches[grepl(pattern = paste(str_split_i(frequency$Var1[i], pattern = '\\*', i = 1), str_split_i(frequency$Var1[i], pattern = '\\*', i = 2), sep = "\\*"), x = intersections_results_matches$matching_alleles), ]$matches))
+    try({
+      for (n_intersections in n_min:n_max) {
+        chosen_allele_match <- chosen_allele %>% filter(matches == n_intersections)
+        chosen_allele_match_TRUE <- chosen_allele_match %>% filter(allele == TRUE)
+        chosen_allele_match_FALSE <- chosen_allele_match %>% filter(allele == FALSE)
+        if (nrow(chosen_allele_match_TRUE)<50) {
+          normcheck_TRUE <- shapiro.test(chosen_allele_match_TRUE$intersections)
+        } else {
+          normcheck_TRUE <- ks.test(chosen_allele_match_TRUE$intersections, "pnorm", mean=mean(chosen_allele_match_TRUE$intersections), sd=sd(chosen_allele_match_TRUE$intersections))
+        }
+        if (nrow(chosen_allele_match_FALSE)<50) {
+          normcheck_FALSE <- shapiro.test(chosen_allele_match_FALSE$intersections)
+        } else {
+          normcheck_FALSE <- ks.test(chosen_allele_match_FALSE$intersections, "pnorm", mean=mean(chosen_allele_match_FALSE$intersections), sd=sd(chosen_allele_match_FALSE$intersections))
+        }
+        if (normcheck_TRUE$p.value > 0.05 & normcheck_FALSE$p.value > 0.05) {
+          test <- t.test(x = chosen_allele_match_TRUE$intersections, y = chosen_allele_match_FALSE$intersections, alternative = "two.sided", var.equal = FALSE)
+          test_name <- "Welch t-test"
+        } else {
+          test <- wilcox.test(x = chosen_allele_match_TRUE$intersections, y = chosen_allele_match_FALSE$intersections, alternative = "two.sided")
+          test_name <- "Wilcoxon"
+        }    
+        allele_vs_intersection <- rbind(allele_vs_intersection, c(str_glue("{frequency$Var1[i]}"), str_glue("{n_intersections}"), str_glue("{nrow(chosen_allele_match_TRUE)}"), str_glue("{nrow(chosen_allele_match_FALSE)}"), str_glue("{round(mean(chosen_allele_match_TRUE$intersections), digits = 3)}"), str_glue("{round(mean(chosen_allele_match_FALSE$intersections), digits = 3)}"), str_glue("{as.numeric(test$p.value)}"), str_glue("{test_name}")))
+        colnames(allele_vs_intersection) <- c("HLA_allele", "matches", "n_TRUE", "n_FALSE", "mean in positive", "mean in negative", "p_value", "test_name")
+        if (as.numeric(test$p.value) < 1) {
+          current_allele <- rbind(chosen_allele_match_TRUE, chosen_allele_match_FALSE)
+          current_allele$check <- str_glue("{frequency$Var1[i]}")
+          allele_vs_intersection_significant <- rbind(allele_vs_intersection_significant, current_allele)
+          colnames(allele_vs_intersection_significant) <- c("sample1", "sample2", "intersections", "donor_ID1", "donor_ID2", "matches", "matching_alleles", "allele", "check")
+        }
+      }
+      }, silent = TRUE)
+    }, silent = TRUE)
+  print(str_glue("{i}, {frequency$Var1[i]}"))
+}
+
+allele_vs_intersection %>% filter(as.numeric(p_value) < 1) 
+allele_vs_intersection_significant %>% count(matches, check)
+ggplot(data = allele_vs_intersection_significant, mapping = aes(x = allele, y = intersections, fill = allele)) + 
+  scale_fill_manual(values=c("#9fc5e8", "#d6a7bd")) +
+  geom_boxplot() +
+  facet_grid(matches~check)
+```
+
+Some stats
+```{r}
+all_clonotypes <- repertoires %>% count(sample_ID)
+quantile(all_clonotypes$n, probs = c(0.25, 0.5, 0.75))
+
+quantile(stats$diversity, probs = c(0.25, 0.5, 0.75))
+
+ALICE_hits_table <- ALICE_OLGA_samples %>% count(sample_ID)
+quantile(ALICE_hits_table$n, probs = c(0.25, 0.5, 0.75))
+
+clonotypes_table <- unique(shared_clusters[, c("donor_ID", "cluster_ID")]) %>% count(donor_ID)
+quantile(clonotypes_table$n, probs = c(0.25, 0.5, 0.75))
+```
+
